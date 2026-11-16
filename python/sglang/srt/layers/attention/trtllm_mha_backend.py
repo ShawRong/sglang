@@ -314,6 +314,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 "with XQA on SM90/SM120."
             )
         self.uses_trtllm_gen_native_fp4 = self.is_nvfp4_kvcache and not self.is_xqa_impl
+        self.resserve_decode = envs.SGLANG_RESSERVE_DECODE.get()
+        if self.resserve_decode and (
+            not self.decode_uses_native_fp4 or self.page_size != 32 or self.is_xqa_impl
+        ):
+            raise ValueError("ResServe decode requires SM100 native NVFP4 page32 KV")
 
         # Speculative decoding
         # Only support topk <= 1 for now.
@@ -1747,7 +1752,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
     ) -> torch.Tensor:
         """Run forward for decode using TRTLLM MHA kernel."""
 
-        use_fused_fp8_path = self._should_use_fused_fp8_path(
+        use_resserve = self.resserve_decode
+        use_fused_fp8_path = not use_resserve and self._should_use_fused_fp8_path(
             save_kv_cache, k, forward_batch
         )
         use_fused_qkv = use_fused_fp8_path and not self.is_xqa_impl
@@ -1774,6 +1780,17 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                     v,
                     *self._kv_write_scales(layer),
                 )
+
+        if use_resserve:
+            from sglang.srt.layers.attention.resserve import forward_resserve_decode
+
+            return forward_resserve_decode(
+                self,
+                q,
+                layer,
+                forward_batch,
+                sinks=kwargs.get("sinks"),
+            )
 
         # For XQA, q_dtype should be bf16. For trtllm-gen,
         # q_dtype should be FP8 when KV is in FP8.
